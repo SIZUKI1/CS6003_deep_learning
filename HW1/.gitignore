@@ -1,0 +1,8 @@
+EuroSAT_RGB/
+*.zip
+*.pkl
+__pycache__/
+.ipynb_checkpoints/
+*.log
+bad_cases/
+*.png
