@@ -1,8 +1,14 @@
-EuroSAT_RGB/
-*.zip
-*.pkl
+# Global Ignores
 __pycache__/
+*.pyc
 .ipynb_checkpoints/
-*.log
-bad_cases/
-*.png
+.DS_Store
+
+# Ignore large datasets and model weights globally
+*.zip
+*.tar.gz
+*.pkl
+*.h5
+*.pth
+
+# Project-specific ignores should be added to their respective folders
