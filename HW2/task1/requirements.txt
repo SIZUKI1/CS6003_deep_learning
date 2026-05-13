@@ -1,0 +1,11 @@
+torch
+torchvision
+numpy
+pillow
+scipy
+scikit-learn
+tqdm
+pandas
+matplotlib
+wandb
+swanlab
