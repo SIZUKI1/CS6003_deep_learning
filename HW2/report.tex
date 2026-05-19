@@ -1,0 +1,453 @@
+\documentclass{article}
+
+% Language setting
+\usepackage[UTF8]{ctex}  % 核心：自动用系统中文字体
+\usepackage{amsmath, graphicx}
+\usepackage{subcaption}
+\usepackage[colorlinks=true, allcolors=blue]{hyperref}
+
+% Set page size and margins
+\usepackage[letterpaper,top=2cm,bottom=2cm,left=3cm,right=3cm,marginparwidth=1.75cm]{geometry}
+% Useful packages
+\usepackage{booktabs}
+\usepackage{multirow} 
+\usepackage{array}    
+\usepackage[table]{xcolor} 
+\usepackage{tabularx}
+\usepackage{float}
+\usepackage{amssymb}
+
+% --- 自定义标签样式 ---
+\newcommand{\attr}[1]{\colorbox{gray!15}{\vphantom{p}\texttt{#1}}}
+
+\title{HW2：期中作业}
+\author{李弈}
+
+\begin{document}
+\maketitle
+\section{任务1：微调在ImageNet 上预训练的卷积神经网络实现宠物识别}
+
+\subsection{实验概述}
+本实验针对 Oxford 102 Category Flower Dataset 完成 102 类花卉图像分类任务。实验以在 ImageNet 上预训练的 ResNet-18 为主干网络，将原始分类层替换为 102 类输出层，并采用“主干网络较小学习率、新分类头较大学习率”的微调策略。围绕任务要求，实验共包含三类对比：
+\begin{enumerate}
+    \item \textbf{Baseline 与超参数分析：}使用 ImageNet 预训练 ResNet-18，比较不同 backbone learning rate 与 head learning rate 组合对收敛速度和分类性能的影响；
+    \item \textbf{预训练消融实验：}使用相同的 ResNet-18 结构，但不加载 ImageNet 预训练参数，从随机初始化开始训练，用于分析预训练迁移学习的作用；
+    \item \textbf{注意力机制实验：}在 Baseline 的基础上引入 SE-block 与 CBAM 注意力模块，比较注意力机制对 Accuracy 和 mAP 的影响。
+\end{enumerate}
+
+实验过程中使用 wandb 记录训练日志，并根据导出的日志绘制训练集/验证集 loss 曲线以及验证集 Accuracy/mAP 曲线。评价指标包括分类准确率 Accuracy 与多类别 mean Average Precision (mAP)。
+
+\subsection{数据集介绍}
+本实验使用 Oxford 102 Category Flower Dataset。该数据集包含 102 个花卉类别，总计 8189 张图像。数据集中不同类别的图像数量不完全相同，并且图像存在尺度、姿态、光照和类内差异等变化，因此属于典型的细粒度图像分类任务。与普通分类任务相比，花卉类别之间往往具有相似的颜色和形状特征，因此模型不仅需要学习低层纹理和颜色信息，还需要捕捉更具判别性的局部结构。
+
+实验使用官方给定的数据划分文件 \texttt{setid.mat}，并根据 \texttt{imagelabels.mat} 读取类别标签。具体划分如表~\ref{tab:task1_data_split} 所示。
+
+\begin{table}[H]
+\centering
+\caption{数据集划分}
+\label{tab:task1_data_split}
+\begin{tabular}{lccc}
+\toprule
+数据划分 & 样本数 & 每轮 batch size & 每轮迭代次数 \\
+\midrule
+训练集 & 1020 & 32 & $\lceil 1020/32\rceil=32$ \\
+验证集 & 1020 & 32 & $\lceil 1020/32\rceil=32$ \\
+测试集 & 6149 & 32 & $\lceil 6149/32\rceil=193$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+由于训练集每类仅约 10 张图像，样本规模较小，因此直接从随机初始化训练深层 CNN 容易出现收敛慢、泛化不足的问题。ImageNet 预训练模型已经学习到边缘、纹理、颜色组合、局部形状等通用视觉特征，因此更适合作为本任务的初始化参数。
+
+\subsubsection{数据预处理与增强}
+训练阶段对输入图像进行随机增强，以提高模型的泛化能力。主要处理包括：
+\begin{itemize}
+    \item 将图像缩放到较大尺寸后进行 \texttt{RandomResizedCrop}，最终输入尺寸为 $224\times224$；
+    \item 使用随机水平翻转和颜色扰动增强样本多样性；
+    \item 使用 ImageNet 均值和标准差进行归一化，以匹配预训练模型的输入分布。
+\end{itemize}
+验证和测试阶段不使用随机增强，仅采用 resize、center crop 和归一化，保证评估结果稳定。
+
+\subsection{模型结构}
+\subsubsection{Baseline：ResNet-18 微调}
+Baseline 模型采用 ResNet-18。ResNet 的核心思想是通过残差连接学习
+\[
+    y = F(x) + x,
+\]
+其中 $x$ 为输入特征，$F(x)$ 为若干卷积层学习到的残差映射。残差连接缓解了深层网络训练中的梯度消失问题，使得网络更容易优化。
+
+本实验加载 ImageNet 预训练的 ResNet-18 参数，并将最后的全连接层由原始 ImageNet 的 1000 类输出替换为 102 类输出：
+\[
+    \mathrm{FC}_{1000} \rightarrow \mathrm{FC}_{102}.
+\]
+新的输出层从随机初始化开始训练；其余卷积主干参数使用较小学习率微调。这种设置的直观含义是：主干网络保留 ImageNet 上学到的通用视觉特征，而分类头快速适配花卉数据集的 102 个类别。
+
+\subsubsection{SE-ResNet-18}
+SE-block（Squeeze-and-Excitation）是一种通道注意力机制。对于输入特征 $X\in\mathbb{R}^{C\times H\times W}$，首先通过全局平均池化得到每个通道的全局响应：
+\[
+    z_c=\frac{1}{H W}\sum_{i=1}^{H}\sum_{j=1}^{W}X_c(i,j).
+\]
+随后经过两层全连接网络和 Sigmoid 函数生成通道权重 $s_c$，并对原特征进行重标定：
+\[
+    \widetilde{X}_c=s_c X_c.
+\]
+直观来说，SE 模块会自动判断“哪些通道更重要”。例如在花卉识别中，某些通道可能更关注花瓣颜色，某些通道关注花蕊纹理，SE 模块可以增强更有判别力的通道。
+
+\subsubsection{CBAM-ResNet-18}
+CBAM（Convolutional Block Attention Module）包含通道注意力和空间注意力两个部分。通道注意力用于判断“哪些特征通道重要”，空间注意力用于判断“图像中哪些位置重要”。其基本形式可写为：
+\[
+    X' = M_c(X)\otimes X,
+\]
+\[
+    X'' = M_s(X')\otimes X',
+\]
+其中 $M_c$ 表示通道注意力，$M_s$ 表示空间注意力，$\otimes$ 表示逐元素乘法。相比 SE，CBAM 结构更复杂，理论上可以同时增强关键通道和关键空间区域，但也会增加训练难度和过拟合风险。
+
+\subsection{实验设置}
+所有实验均训练 30 个 epoch，batch size 为 32，输入图像大小为 $224\times224$。优化器采用 AdamW，权重衰减为 $10^{-4}$，损失函数采用交叉熵损失：
+\[
+    \mathcal{L}=-\sum_{k=1}^{102} y_k\log p_k,
+\]
+其中 $y_k$ 为 one-hot 标签，$p_k$ 为模型预测该类别的概率。学习率采用余弦退火策略逐步衰减。
+
+评价指标包括：
+\begin{itemize}
+    \item \textbf{Accuracy：}预测类别与真实类别一致的样本比例；
+    \item \textbf{mAP：}对 102 个类别分别计算 Average Precision，再取宏平均，用于衡量模型对各类别置信度排序的整体质量。
+\end{itemize}
+
+各组实验设置如表~\ref{tab:task1_config} 所示。
+
+\begin{table}[H]
+\centering
+\caption{实验设置对比}
+\label{tab:task1_config}
+\begin{tabular}{lccccc}
+\toprule
+实验名称 & 模型 & 预训练 & Backbone LR & Head LR & Epoch \\
+\midrule
+Baseline-A & ResNet-18 & ImageNet & $3\times10^{-5}$ & $3\times10^{-4}$ & 30 \\
+Baseline-B & ResNet-18 & ImageNet & $1\times10^{-5}$ & $1\times10^{-3}$ & 30 \\
+Baseline-C & ResNet-18 & ImageNet & $1\times10^{-4}$ & $1\times10^{-3}$ & 30 \\
+SE-ResNet-18 & ResNet-18+SE & ImageNet & $1\times10^{-4}$ & $1\times10^{-3}$ & 30 \\
+CBAM-ResNet-18 & ResNet-18+CBAM & ImageNet & $1\times10^{-4}$ & $1\times10^{-3}$ & 30 \\
+Random Init & ResNet-18 & 无 & $1\times10^{-3}$ & $1\times10^{-3}$ & 30 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{实验结果}
+表~\ref{tab:task1_result} 给出了六组实验在验证集和测试集上的核心结果。最佳模型根据验证集 Accuracy 选择，并在测试集上进行最终评估。
+
+\begin{table}[H]
+\centering
+\caption{实验结果对比}
+\label{tab:task1_result}
+\begin{tabular}{lcccc}
+\toprule
+实验名称 & 最佳 Epoch & 最佳 Val Acc & Test Acc & Test mAP \\
+\midrule
+Baseline-A ($3e^{-5}/3e^{-4}$) & 27 & 0.9088 & 0.8762 & 0.9409 \\
+Baseline-B ($1e^{-5}/1e^{-3}$) & 22 & 0.8990 & 0.8725 & 0.9402 \\
+\textbf{Baseline-C ($1e^{-4}/1e^{-3}$)} & \textbf{22} & \textbf{0.9304} & \textbf{0.8949} & \textbf{0.9550} \\
+SE-ResNet-18 & 14 & 0.9176 & 0.8824 & 0.9447 \\
+CBAM-ResNet-18 & 24 & 0.8716 & 0.8341 & 0.9056 \\
+Random Init & 25 & 0.4225 & 0.3420 & 0.3791 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+从表~\ref{tab:task1_result} 可以看出，综合测试集 Accuracy 和 mAP，最佳结果来自 Baseline-C，即 backbone learning rate 为 $1\times10^{-4}$、head learning rate 为 $1\times10^{-3}$ 的 ImageNet 预训练 ResNet-18。该模型测试集 Accuracy 达到 0.8949，测试集 mAP 达到 0.9550。与随机初始化模型相比，测试集 Accuracy 提升约 55.29 个百分点，mAP 提升约 0.5759，说明 ImageNet 预训练对小样本花卉分类任务具有显著帮助。
+
+\subsection{训练曲线可视化与分析}
+本节结合 wandb 记录结果导出的曲线，对训练过程进行分析。每组实验均包含训练集和验证集 loss 曲线，以及训练集 Accuracy、验证集 Accuracy 和验证集 mAP 曲线。
+
+\subsubsection{不同学习率 Baseline 对比}
+图~\ref{fig:task1_baseline_curves} 展示了三组预训练 ResNet-18 在不同学习率组合下的训练曲线。
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.47\textwidth}
+    \includegraphics[width=\linewidth]{loss_baseline_bb3e-5_head3e-4.png}
+    \caption{Baseline-A Loss}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.47\textwidth}
+    \includegraphics[width=\linewidth]{accmap_baseline_bb3e-5_head3e-4.png}
+    \caption{Baseline-A Acc/mAP}
+\end{subfigure}
+
+\begin{subfigure}{0.47\textwidth}
+    \includegraphics[width=\linewidth]{loss_baseline_bb1e-5_head1e-3.png}
+    \caption{Baseline-B Loss}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.47\textwidth}
+    \includegraphics[width=\linewidth]{accmap_baseline_bb1e-5_head1e-3.png}
+    \caption{Baseline-B Acc/mAP}
+\end{subfigure}
+
+\begin{subfigure}{0.47\textwidth}
+    \includegraphics[width=\linewidth]{loss_baseline_bb1e-4_head1e-3.png}
+    \caption{Baseline-C Loss}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.47\textwidth}
+    \includegraphics[width=\linewidth]{accmap_baseline_bb1e-4_head1e-3.png}
+    \caption{Baseline-C Acc/mAP}
+\end{subfigure}
+\caption{不同学习率组合下的 ResNet-18 Baseline 曲线}
+\label{fig:task1_baseline_curves}
+\end{figure}
+
+三组 Baseline 的训练 loss 都快速下降，说明 ImageNet 预训练特征能够较快适应花卉分类任务。Baseline-A 的 backbone 和 head 学习率都较小，训练过程较稳定，但验证集 Accuracy 最终约在 0.90 附近波动，测试集 Accuracy 为 0.8762。Baseline-B 使用更小的 backbone 学习率 $1\times10^{-5}$，虽然 head 学习率较大，但主干网络更新幅度过小，导致模型对花卉数据集的适配能力不足，最终测试集 Accuracy 为 0.8725，略低于 Baseline-A。
+
+Baseline-C 的 backbone 学习率提升至 $1\times10^{-4}$，head 学习率保持 $1\times10^{-3}$。从曲线看，该设置前几个 epoch 收敛最快，验证集 Accuracy 很快超过 0.90，并在后期稳定在 0.92--0.93 左右。其验证 loss 也低于另外两组 Baseline，最终取得最高的测试集 Accuracy 和 mAP。这表明，在本任务中，backbone 不能完全冻结或更新过慢；适当增大 backbone 学习率可以让预训练特征更好地迁移到细粒度花卉分类任务。
+
+同时，三组 Baseline 均出现训练 Accuracy 接近 1.0 而验证 Accuracy 不再明显提升的现象，说明模型在后期已经基本拟合训练集。由于训练集只有 1020 张图像，后续若进一步提升性能，可以考虑更强的数据增强、label smoothing、mixup/cutmix 或 early stopping。
+
+\subsubsection{注意力机制对比}
+图~\ref{fig:task1_attention_curves} 展示了 SE-ResNet-18 与 CBAM-ResNet-18 的训练曲线。
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.47\textwidth}
+    \includegraphics[width=\linewidth]{loss_se_resnet18.png}
+    \caption{SE-ResNet-18 Loss}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.47\textwidth}
+    \includegraphics[width=\linewidth]{accmap_se_resnet18.png}
+    \caption{SE-ResNet-18 Acc/mAP}
+\end{subfigure}
+
+\begin{subfigure}{0.47\textwidth}
+    \includegraphics[width=\linewidth]{loss_cbam_resnet18.png}
+    \caption{CBAM-ResNet-18 Loss}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.47\textwidth}
+    \includegraphics[width=\linewidth]{accmap_cbam_resnet18.png}
+    \caption{CBAM-ResNet-18 Acc/mAP}
+\end{subfigure}
+\caption{注意力机制模型训练曲线}
+\label{fig:task1_attention_curves}
+\end{figure}
+
+SE-ResNet-18 的收敛速度较快，验证集 Accuracy 在前 10 个 epoch 内已经达到较高水平，并在第 14 个 epoch 取得最佳验证集 Accuracy 0.9176。其测试集 Accuracy 为 0.8824，mAP 为 0.9447，明显优于随机初始化模型，也优于 CBAM 模型。但与最佳 Baseline-C 相比，SE-ResNet-18 的测试集 Accuracy 低约 1.25 个百分点。这说明 SE 通道注意力能够增强通道选择能力，但在当前训练设置下，并没有超过调参后的 ResNet-18 Baseline。
+
+CBAM-ResNet-18 的训练曲线显示，其早期收敛明显慢于 SE 和 Baseline-C。尤其在第 1 个 epoch 附近，验证 Accuracy 很低，随后逐渐恢复并提升到 0.87 左右。最终 CBAM 测试集 Accuracy 为 0.8341，mAP 为 0.9056，低于 SE 和所有预训练 Baseline。可能原因是 CBAM 同时引入通道注意力和空间注意力，结构更复杂，会改变预训练残差特征的分布；在训练集较小且未使用 warmup 的情况下，模型更难稳定优化。对于 CBAM，后续可以尝试降低注意力模块学习率、增加 warmup、冻结前几层，或延长训练轮数。
+
+\subsubsection{预训练消融实验}
+图~\ref{fig:task1_random_curves} 展示了从随机初始化开始训练的 ResNet-18 曲线。
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.47\textwidth}
+    \includegraphics[width=\linewidth]{loss_random_resnet18.png}
+    \caption{Random Init Loss}
+\end{subfigure}
+\hfill
+\begin{subfigure}{0.47\textwidth}
+    \includegraphics[width=\linewidth]{accmap_random_resnet18.png}
+    \caption{Random Init Acc/mAP}
+\end{subfigure}
+\caption{随机初始化 ResNet-18 训练曲线}
+\label{fig:task1_random_curves}
+\end{figure}
+
+随机初始化模型的曲线与预训练模型差异非常明显。其训练 loss 虽然逐步下降，但下降速度远慢于预训练模型；验证 loss 长期保持在较高水平，并且 Accuracy/mAP 上升较慢。最终随机初始化模型的测试集 Accuracy 仅为 0.3420，mAP 为 0.3791。该结果说明，在只有 1020 张训练图片的情况下，模型很难从零学习到稳定且泛化良好的视觉特征。
+
+与随机初始化相比，最佳预训练 Baseline-C 的测试集 Accuracy 从 0.3420 提升到 0.8949，提升约 55.29 个百分点。这一消融实验充分说明：对于小样本细粒度分类任务，ImageNet 预训练提供的通用视觉表征是模型性能提升的关键因素。
+
+\subsection{总结分析}
+\subsubsection{学习率的影响}
+三组 Baseline 表明，学习率组合直接影响微调效果。若 backbone 学习率过小，模型主干特征更新不足，难以充分适配花卉类别；若学习率适中，则既能保留 ImageNet 预训练知识，又能根据目标数据集调整高层语义特征。本实验中 $1\times10^{-4}/1\times10^{-3}$ 是最优组合，说明新分类头需要较快学习，而主干网络也需要一定幅度的微调。
+
+\subsubsection{注意力模块的影响}
+SE 和 CBAM 的结果说明，注意力机制并不一定在所有设置下都能带来提升。SE 模块结构较轻量，只对通道进行重标定，因此对预训练 ResNet 的扰动较小，最终效果接近 Baseline。CBAM 额外加入空间注意力，表达能力更强，但在小训练集上可能更难优化，也更容易受到学习率、初始化和正则化策略影响。因此，在本实验条件下，直接加入 CBAM 并未获得性能提升。
+
+\subsubsection{预训练的作用}
+随机初始化模型与预训练模型的差距最大。预训练模型在前几个 epoch 内即可取得较高验证 Accuracy，而随机初始化模型到第 30 个 epoch 仍未达到预训练模型早期水平。这说明 ImageNet 预训练不仅提高了最终性能，也显著加快了收敛速度。
+
+\subsubsection{结论}
+本实验完成了基于 ImageNet 预训练 CNN 的 Oxford 102 类花卉识别任务，并比较了不同学习率、预训练消融和注意力机制的影响。主要结论如下：
+\begin{enumerate}
+    \item 最优模型为 ImageNet 预训练 ResNet-18，学习率组合为 backbone $1\times10^{-4}$、head $1\times10^{-3}$，测试集 Accuracy 为 0.8949，测试集 mAP 为 0.9550；
+    \item 预训练带来的提升非常显著。与随机初始化相比，最佳预训练模型测试集 Accuracy 提升约 55.29 个百分点，说明迁移学习非常适合小样本细粒度分类任务；
+    \item SE 注意力模块取得了较好的结果，但未超过最佳 Baseline；CBAM 在当前设置下表现较弱，可能需要更细致的学习率、warmup 或正则化策略；
+    \item 从训练曲线看，预训练模型收敛快，训练 loss 很快接近 0，而验证集指标在中后期趋于平台，说明后续可以通过 early stopping、更强数据增强和正则化进一步提升泛化能力。
+\end{enumerate}
+
+\section{任务2：场景目标检测与视频多目标跟踪}
+
+本实验旨在构建一个端到端的交通场景车辆检测与多目标跟踪系统。实验涉及模型微调、多目标追踪、遮挡分析及越线计数等多个环节。
+
+\subsection{模型与算法原理}
+
+\subsubsection{YOLOv8 检测架构与损失函数}
+YOLOv8 是一种先进的 Anchor-free 单阶段目标检测模型。其主干网络采用了跨阶段局部网络（CSPNet）的设计思想，提取丰富的多尺度特征；颈部采用 PANet 结构实现自顶向下与自底向上的特征融合。YOLOv8 的重大改进在于引入了解耦头（Decoupled Head），将分类与回归任务分离。
+在损失函数设计上，YOLOv8 的分类损失采用了二元交叉熵损失（BCE Loss），而边界框回归采用了 Distribution Focal Loss (DFL) 与 CIoU Loss 的加权组合。其中 CIoU Loss 考虑了真实框与预测框的重叠面积、中心点距离和长宽比，有效提升了复杂场景下的定位精度。
+
+\subsubsection{ByteTrack 多目标跟踪原理}
+由于 YOLOv8 仅对单帧进行独立检测，本实验引入 ByteTrack 作为多目标跟踪引擎。ByteTrack 通过卡尔曼滤波（Kalman Filter）对目标的运动状态进行线性预测，并利用匈牙利算法完成预测框与当前帧检测框的匹配。
+其核心创新在于\textbf{两阶段关联策略}：第一阶段仅将高置信度检测框与已有轨迹匹配；第二阶段将未匹配的轨迹与低置信度检测框再次匹配。当车辆被短暂遮挡导致置信度骤降时，该机制能够“捡回”低分目标，有效维持 Tracking ID 的稳定性。
+
+\subsection{实验设置 (Experimental Setup)}
+
+\subsubsection{数据集、数据预处理与增强}
+实验使用了 \textbf{Road Vehicle Images Dataset}（包含孟加拉国路面交通场景），该数据集共有 21 个复杂的车辆类别。数据集被划分为训练集（2704张图像）和验证集（300张图像）。
+
+为应对交通监控视角下的尺度变化与遮挡问题，本实验在 YOLOv8 训练期间开启了丰富的数据增强策略：
+\begin{itemize}
+    \item \textbf{Mosaic 增强}：将 4 张不同的图像随机缩放并拼接成一张图，极大丰富了背景多样性，并增强了对远端小目标车辆的检测能力。
+    \item \textbf{HSV 颜色扰动}：随机调整图像的色调、饱和度和明度，以模拟不同光照和天气条件下的路口画面。
+    \item \textbf{几何变换}：随机应用平移、缩放与水平翻转，防止模型过拟合特定的车流方向。
+\end{itemize}
+
+检测模型选用了 \textbf{YOLOv8s}（Small版本），在保证推理速度的同时维持较高的检测精度。模型初始化使用 COCO 预训练权重。训练超参数设置如下：
+\begin{itemize}
+    \item \textbf{Epochs}: 100
+    \item \textbf{Batch Size}: 32
+    \item \textbf{Image Size}: 640$\times$640
+    \item \textbf{Optimizer}: SGD (初始学习率 $lr=0.01$，Momentum=0.937)
+    \item \textbf{Early Stopping Patience}: 20
+\end{itemize}
+训练过程使用 SwanLab 进行了全过程监控与可视化。
+
+\subsubsection{视频多目标跟踪与越线计数设置}
+测试视频选用了一段长为 30 秒、帧率 12fps、分辨率为 1920$\times$1012 的真实交通路口监控视频。
+\begin{itemize}
+    \item \textbf{跟踪算法}：采用 \textbf{ByteTrack} 算法，其通过关联高低置信度的检测框，能够有效缓解目标在遮挡时的丢失问题。
+    \item \textbf{越线计数设置}：根据视频实际视角，我们将水平虚拟线设置在 $Y_{line} = 0.55H$（即画面高度的55\%处），该位置正好对应路口的车辆停止实线。在状态机逻辑设计上，设目标中心点在 $t$ 时刻和 $t+1$ 时刻的纵坐标分别为 $y_t$ 和 $y_{t+1}$，当且仅当 $y_t > Y_{line}$ 且 $y_{t+1} \leq Y_{line}$ 时，系统判定目标发生“向上越线”并完成计数。
+\end{itemize}
+
+\subsection{实验结果 (Experimental Results)}
+
+\subsubsection{检测模型训练结果}
+经过 100 个 Epoch 的训练，模型在验证集上达到了收敛状态。最终性能指标如下表所示：
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}cccc@{}}
+\toprule
+\textbf{mAP@0.5} & \textbf{mAP@0.5:0.95} & \textbf{Precision (精确率)} & \textbf{Recall (召回率)} \\ \midrule
+0.521            & 0.297                 & 0.665                        & 0.494                     \\ \bottomrule
+\end{tabular}
+\caption{YOLOv8s 在验证集上的最终性能指标}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    % 请替换为你自己截图的训练曲线图（如 results.png 或 SwanLab 截图）
+    \includegraphics[width=0.8\textwidth]{training_curve.png}
+    \caption{模型训练过程中的 Loss 及 mAP 变化曲线}
+\end{figure}
+
+从上述指标可以看出，模型在 mAP@0.5 指标上达到了 0.521，表明在较低的 IoU 阈值要求下，模型能够成功定位并分类过半数的车辆。然而，更严格的 mAP@0.5:0.95 仅为 0.297，出现了显著的性能衰减。这种现象在交通路口场景中非常典型：由于大量车辆相互拥挤、重叠，且远端车辆像素占比极小，导致回归出一个与真实标签完美贴合的高质量边界框极为困难。这反映了在密集场景下，精细的边界框回归比单纯的目标检出更具挑战性。
+
+\subsubsection{多目标跟踪与越线计数结果}
+在 30 秒的测试视频中，跟踪算法共捕捉到了 \textbf{189} 个独立的车辆跟踪轨迹（Track IDs）。
+在越线计数任务中，系统成功统计到共有 \textbf{22 辆车} 自下而上（Up/Left 方向）越过了 $y=0.55$ 处的停止实线，且没有发生重复计数现象。
+
+\subsubsection{遮挡与 ID 跳变检测}
+程序对全视频的轨迹连续性进行了自动分析，总共检测到 \textbf{51} 次明显的 \textbf{ID 跳变 (ID Jump)} 事件（同一物理目标由于遮挡丢失后，重新被分配了新的 ID）。
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{threewheels.png}
+    \caption{密集交汇与目标遮挡场景展示}
+\end{figure}
+
+\subsection{讨论 (Discussion)}
+
+\subsubsection{模型检测能力的局限性}
+虽然模型达到了 0.521 的 mAP@0.5，但由于数据集中包含了多达 21 个类别，且部分类别特征极为相似，这导致了细粒度分类的困难。在真实的测试视频中，我们观察到一个典型的错误情况：即使目标被成功连续跟踪（保持同一个 Track ID），其预测类别也会出现突然变换的“闪烁”现象。例如在分析截图（图 2）中，一辆蓝色客车（ID:147）在连续帧中由 \textit{pickup} 突然变为 \textit{van}。这主要是因为本实验直接提取当前帧 YOLO 的独立检测类别作为最终输出，缺乏对时序轨迹上类别一致性的投票或平滑约束；加上远端车辆像素较小，外观特征极易受角度变化影响，从而导致了同一轨迹类别检测的剧烈波动。
+
+\subsubsection{遮挡导致的 ID 跳变分析}
+在测试视频中，系统自动检测到了多达 51 次 ID 跳变。结合实际画面观察（如图 2），这主要是因为车辆在汇向路口远端时，透视效应使得远端的车辆视觉分布变得极其密集；同时，车辆之间频繁的相互变道穿插，导致了大量的动态互相遮挡。以图 2 中的棕色三轮车为例，深刻揭示了跳变发生的过程：
+\begin{enumerate}
+    \item \textbf{检测框丢失}：棕色三轮车起初作为目标 A（ID:192, three wheelers）被稳定跟踪，随后被变道驶来的大型白色公交车目标 B（ID:271）完全遮挡，YOLOv8 在此期间完全无法输出目标 A 的检测框。
+    \item \textbf{卡尔曼滤波失效}：虽然 ByteTrack 内部的 Kalman Filter 能在检测丢失的短时间内，基于历史线性运动预测目标 A 的位置，但由于目标 A 被遮挡期间伴随了轻微的变道避让动作，且由于大巴车体积大导致遮挡时间长，线性预测的坐标与目标的真实运动轨迹发生了严重背离。
+    \item \textbf{ID 重分配}：当棕色三轮车终于驶出白色大巴车的遮挡，重新出现在画面中时，由于其实际位置与 Kalman Filter 预测位置相差过大（导致空间上的 IoU 匹配失败），ByteTrack 无法将其与之前的原轨迹（ID:192）进行关联，只能将其视为新出现的目标，为其分配了一个全新的 Track ID（ID:57，且由于视角变化，类别甚至被错分为 rickshaw），由此产生了我们所记录到的典型 ID 跳变。
+\end{enumerate}
+
+\subsection{结论 (Conclusion)}
+
+本实验成功实现了一个基于 YOLOv8 与 ByteTrack 的交通监控视频分析 pipeline。实验结果表明，该系统能够有效地对路口车流进行实时检测、跟踪与越线统计。虽然在车辆密集遮挡场景下仍存在 ID 跳变的问题，但系统在整体流量计数上表现出了良好的鲁棒性。未来的改进可以考虑引入外观重识别特征，以进一步缓解严重遮挡带来的轨迹断裂问题。
+
+\section{任务3：从零搭建与损失函数工程：图像分割模型的像素级训练}
+
+\subsection{实验设置}
+
+\subsubsection{数据集}
+本文采用 Stanford Background Dataset 进行实验。该数据集包含 715 张户外场景图像，标注了 8 个语义类别：天空、树木、道路、草地、水域、建筑、山脉和前景物体。标签中 $-1$ 表示未标注像素，训练时忽略。所有图像统一缩放至 $256 \times 256$，按 95\% 训练集和 5\% 验证集划分。
+
+\subsubsection{实现细节}
+使用 PyTorch 从零搭建 U-Net 网络，包含 4 层下采样编码器、4 层上采样解码器及 Skip Connection 特征拼接。所有模型均使用随机初始化权重，不加载任何预训练参数。具体超参数设置见表~\ref{tab:task3_settings}。
+
+\begin{table}[htbp]
+\centering
+\caption{训练超参数设置}
+\label{tab:task3_settings}
+\begin{tabular}{lc}
+\hline
+参数 & 取值 \\
+\hline
+批量大小 (Batch Size) & 4 \\
+训练轮数 (Epochs) & 20 \\
+学习率 (Learning Rate) & $1 \times 10^{-4}$ \\
+优化器 (Optimizer) & Adam (权重衰减 $1 \times 10^{-5}$) \\
+学习率调度 (Scheduler) & CosineAnnealingLR \\
+输入尺寸 & $256 \times 256$ \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsubsection{损失函数}
+本文对比三种损失函数配置：
+
+\begin{itemize}
+    \item \textbf{交叉熵损失 (CE)}：标准像素级分类损失，设置 $\text{ignore\_index} = -1$ 忽略未标注像素。
+    \item \textbf{Dice 损失}：基于区域重叠的损失函数，定义为 $\mathcal{L}_{\text{Dice}} = 1 - \frac{2|P \cap G|}{|P| + |G|}$，其中 $P$ 和 $G$ 分别表示预测区域和真实区域。
+    \item \textbf{组合损失 (CE + Dice)}：$\mathcal{L} = \mathcal{L}_{\text{CE}} + 0.1 \cdot \mathcal{L}_{\text{Dice}}$，兼顾像素级分类和区域级重叠。
+\end{itemize}
+
+\subsection{实验结果}
+
+\subsubsection{定量对比}
+表~\ref{tab:task3_results} 展示了三种损失函数在验证集上的最佳 mIoU。组合损失取得最高 mIoU 为 54.6\%，优于单独使用 CE（53.9\%）和 Dice 损失（51.3\%）。
+
+\begin{table}[htbp]
+\centering
+\caption{验证集最佳 mIoU 对比}
+\label{tab:task3_results}
+\begin{tabular}{lccc}
+\hline
+损失函数 & 最佳 mIoU & 最终训练损失 & 最终验证损失 \\
+\hline
+交叉熵 (CE) & 0.539 & 0.627 & 0.746 \\
+Dice & 0.513 & 0.585 & 1.394 \\
+CE + Dice & 0.546 & 0.673 & 0.727 \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsubsection{收敛性分析}
+图~\ref{fig:task3_results} 展示了训练过程中的损失曲线和 mIoU 变化。CE 和 CE+Dice 收敛平稳，验证损失稳定下降；而单独使用 Dice 损失时验证损失波动较大，最终 mIoU 较低。
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{comparison_results.png}
+\caption{左图：训练与验证损失曲线；中图：验证集 mIoU 曲线；右图：不同损失函数的最佳 mIoU 对比柱状图。}
+\label{fig:task3_results}
+\end{figure}
+
+\subsection{讨论}
+
+CE 损失作为基线表现良好，收敛速度快且稳定，但由于数据集中存在类别不平衡（如水域、前景物体等类别样本较少），其对少数类的分割效果有限。单独使用 Dice 损失时，训练初期 Loss 值较高且收敛缓慢，验证损失波动明显，最终 mIoU 低于 CE 损失，表明 Dice 损失单独使用在此任务上效果不佳。组合损失（CE + Dice）有效结合了两者的优势：CE 提供稳定的梯度信号引导模型快速收敛，Dice 修正了 CE 对类别不平衡的敏感性，提升了小目标和边界区域的分割质量。实验结果表明，在图像分割任务中，组合损失策略是处理类别不平衡问题的有效方法。
+
+\subsection{结论}
+
+本文从零搭建了 U-Net 网络，并在 Stanford Background Dataset 上对比了三种损失函数的性能。实验结果表明，交叉熵与 Dice 损失的组合取得了最佳 mIoU（54.6\%），验证了混合损失函数在语义分割任务中缓解类别不平衡问题的有效性。
+\end{document}

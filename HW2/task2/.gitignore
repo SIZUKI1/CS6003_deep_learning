@@ -1,2 +1,37 @@
-# Task 2 specific ignores
-# Add any large files or local test results specific to Task 2 here
+# Task 2: Scene Object Detection & Video Multi-Object Tracking
+
+# Dataset
+data/
+
+# Training outputs
+runs/
+
+# Inference outputs
+outputs/
+
+# Model weights
+*.pt
+*.onnx
+*.engine
+
+# Videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# SwanLab logs
+swanlog/
+swanlab-media/
+
+# WandB logs
+wandb/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# System
+.DS_Store
+Thumbs.db
