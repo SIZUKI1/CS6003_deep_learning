@@ -19,6 +19,14 @@ import cv2
 import numpy as np
 
 
+def ccw(A, B, C):
+    return (C[1] - A[1]) * (B[0] - A[0]) > (B[1] - A[1]) * (C[0] - A[0])
+
+
+def intersect(A, B, C, D):
+    return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Line-Crossing Counter")
     parser.add_argument("--source", type=str, required=True)
@@ -33,6 +41,8 @@ def main():
                         help="Line direction")
     parser.add_argument("--line-x", type=float, default=0.5,
                         help="Virtual line X position for vertical line (0-1)")
+    parser.add_argument("--line-coords", type=int, nargs=4, default=None,
+                        help="Virtual line coordinates as x1 y1 x2 y2. Overrides line-direction/y/x if set.")
     args = parser.parse_args()
 
     from ultralytics import YOLO
@@ -61,17 +71,24 @@ def main():
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     # Define virtual line
-    if args.line_direction == "horizontal":
-        line_pos = int(height * args.line_y)
-        line_p1 = (0, line_pos)
-        line_p2 = (width, line_pos)
+    if args.line_coords:
+        x1, y1, x2, y2 = args.line_coords
+        line_p1 = (x1, y1)
+        line_p2 = (x2, y2)
+        line_pos = None # not a single coordinate
+        print(f"Video: {width}x{height} @ {fps}fps, {total_frames} frames")
+        print(f"Line: custom coordinates {line_p1} -> {line_p2}")
     else:
-        line_pos = int(width * args.line_x)
-        line_p1 = (line_pos, 0)
-        line_p2 = (line_pos, height)
-
-    print(f"Video: {width}x{height} @ {fps}fps, {total_frames} frames")
-    print(f"Line: {args.line_direction} at {'y' if args.line_direction == 'horizontal' else 'x'}={line_pos}")
+        if args.line_direction == "horizontal":
+            line_pos = int(height * args.line_y)
+            line_p1 = (0, line_pos)
+            line_p2 = (width, line_pos)
+        else:
+            line_pos = int(width * args.line_x)
+            line_p1 = (line_pos, 0)
+            line_p2 = (line_pos, height)
+        print(f"Video: {width}x{height} @ {fps}fps, {total_frames} frames")
+        print(f"Line: {args.line_direction} at {'y' if args.line_direction == 'horizontal' else 'x'}={line_pos}")
 
     # Output video
     out_path = str(output_dir / "counting_output.mp4")
@@ -133,43 +150,64 @@ def main():
                 if tid >= 0 and tid in prev_centers:
                     prev_cx, prev_cy, _ = prev_centers[tid]
 
-                    if args.line_direction == "horizontal":
-                        # Crossing from above to below
-                        if prev_cy < line_pos and cy >= line_pos:
+                    if args.line_coords:
+                        p_prev = (prev_cx, prev_cy)
+                        p_curr = (cx, cy)
+                        if intersect(p_prev, p_curr, line_p1, line_p2):
                             if tid not in crossed_ids:
-                                cross_count_down += 1
+                                # Determine direction relative to line vector
+                                prev_side = (prev_cx - line_p1[0]) * (line_p2[1] - line_p1[1]) - (prev_cy - line_p1[1]) * (line_p2[0] - line_p1[0])
                                 crossed_ids.add(tid)
-                                crossing_events.append({
-                                    "frame": frame_idx, "track_id": tid,
-                                    "class": cls_name, "direction": "down",
-                                })
-                        # Crossing from below to above
-                        elif prev_cy >= line_pos and cy < line_pos:
-                            if tid not in crossed_ids:
-                                cross_count_up += 1
-                                crossed_ids.add(tid)
-                                crossing_events.append({
-                                    "frame": frame_idx, "track_id": tid,
-                                    "class": cls_name, "direction": "up",
-                                })
+                                if prev_side > 0:
+                                    cross_count_down += 1
+                                    crossing_events.append({
+                                        "frame": frame_idx, "track_id": tid,
+                                        "class": cls_name, "direction": "down_or_right",
+                                    })
+                                else:
+                                    cross_count_up += 1
+                                    crossing_events.append({
+                                        "frame": frame_idx, "track_id": tid,
+                                        "class": cls_name, "direction": "up_or_left",
+                                    })
                     else:
-                        # Vertical line crossing
-                        if prev_cx < line_pos and cx >= line_pos:
-                            if tid not in crossed_ids:
-                                cross_count_down += 1
-                                crossed_ids.add(tid)
-                                crossing_events.append({
-                                    "frame": frame_idx, "track_id": tid,
-                                    "class": cls_name, "direction": "right",
-                                })
-                        elif prev_cx >= line_pos and cx < line_pos:
-                            if tid not in crossed_ids:
-                                cross_count_up += 1
-                                crossed_ids.add(tid)
-                                crossing_events.append({
-                                    "frame": frame_idx, "track_id": tid,
-                                    "class": cls_name, "direction": "left",
-                                })
+                        if args.line_direction == "horizontal":
+                            # Crossing from above to below
+                            if prev_cy < line_pos and cy >= line_pos:
+                                if tid not in crossed_ids:
+                                    cross_count_down += 1
+                                    crossed_ids.add(tid)
+                                    crossing_events.append({
+                                        "frame": frame_idx, "track_id": tid,
+                                        "class": cls_name, "direction": "down",
+                                    })
+                            # Crossing from below to above
+                            elif prev_cy >= line_pos and cy < line_pos:
+                                if tid not in crossed_ids:
+                                    cross_count_up += 1
+                                    crossed_ids.add(tid)
+                                    crossing_events.append({
+                                        "frame": frame_idx, "track_id": tid,
+                                        "class": cls_name, "direction": "up",
+                                    })
+                        else:
+                            # Vertical line crossing
+                            if prev_cx < line_pos and cx >= line_pos:
+                                if tid not in crossed_ids:
+                                    cross_count_down += 1
+                                    crossed_ids.add(tid)
+                                    crossing_events.append({
+                                        "frame": frame_idx, "track_id": tid,
+                                        "class": cls_name, "direction": "right",
+                                    })
+                            elif prev_cx >= line_pos and cx < line_pos:
+                                if tid not in crossed_ids:
+                                    cross_count_up += 1
+                                    crossed_ids.add(tid)
+                                    crossing_events.append({
+                                        "frame": frame_idx, "track_id": tid,
+                                        "class": cls_name, "direction": "left",
+                                    })
 
         prev_centers = current_centers
 
@@ -182,7 +220,12 @@ def main():
         cv2.rectangle(annotated, (10, height - 120), (350, height - 10), (0, 0, 0), -1)
         cv2.rectangle(annotated, (10, height - 120), (350, height - 10), (0, 255, 0), 2)
 
-        if args.line_direction == "horizontal":
+        if args.line_coords:
+            cv2.putText(annotated, f"Down/Right: {cross_count_down}",
+                        (20, height - 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(annotated, f"Up/Left: {cross_count_up}",
+                        (20, height - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        elif args.line_direction == "horizontal":
             cv2.putText(annotated, f"Down: {cross_count_down}",
                         (20, height - 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             cv2.putText(annotated, f"Up: {cross_count_up}",
